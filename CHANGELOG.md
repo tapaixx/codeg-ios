@@ -4,7 +4,7 @@ All notable changes to Codeg for iOS are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Add changes under `## [Unreleased]` as you land them. When you cut a release,
+Add changes under `## [Unreleased]` as you work. When you cut a release,
 `scripts/release.sh` moves that section under a new version heading and reuses
 the text as the git tag message and the GitHub Release notes.
 
@@ -12,11 +12,28 @@ the text as the git tag message and the GitHub Release notes.
 
 ### Added
 
+- iOS 26 continued-processing support for user-started live agent streams.
+- Actionable background notifications for permission requests, agent questions,
+  and plan approvals, including a second confirmation for Always Allow.
+- GitHub Actions packaging for a verified unsigned device IPA.
+- `docs/background-agent-ux.md` with the accepted background/recovery UX design.
+
 ### Changed
 
 - Apple signing now uses an ignored local configuration instead of a committed
   development team identifier.
+- Live event sockets transparently reconnect and re-attach with `since_seq`, so
+  ordinary Wi-Fi/5G/VPN changes and short background interruptions no longer
+  have to become visible chat reconnect state.
+- Network restoration accelerates an already-pending reconnect without tearing
+  down a still-healthy socket merely because the network path changed.
+
 ### Fixed
+
+- Returning from another app no longer needs to treat the foreground transition
+  itself as a connection failure.
+- Pending interactive requests are restored from an authoritative re-attach
+  snapshot and can be surfaced as background actions after a transient drop.
 
 ## [1.0.1] - 2026-07-07
 
