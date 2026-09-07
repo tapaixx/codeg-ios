@@ -88,7 +88,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v1.0.1-tapaixx.1
+          TAG: v1.0.1-tapaixx.2
           BASENAME: ${{ steps.package.outputs.basename }}
           VERSION: ${{ steps.package.outputs.version }}
           BUILD: ${{ steps.package.outputs.build }}
@@ -98,14 +98,13 @@ jobs:
           SHA="build/ipa/${BASENAME}.ipa.sha256"
 
           cat > build/release-notes.md <<EOF
-          ## Codeg iOS ${VERSION} (${BUILD}) — tapaixx background UX build
+          ## Codeg iOS ${VERSION} (${BUILD}) — tapaixx handshake hotfix
 
-          - Keeps user-started agent streams eligible for iOS 26 continued background processing.
-          - Transparently reattaches dropped WebSockets using event sequence replay.
-          - Avoids surfacing short transport reconnects as chat state.
-          - Accelerates an already-needed reconnect when network connectivity returns.
-          - Adds actionable background notifications for permission, question, and plan approval requests.
-          - Includes the accepted architecture in `docs/background-agent-ux.md`.
+          - Keeps the initial WebSocket handshake equivalent to upstream.
+          - Activates continued-processing, network monitoring, and notifications only after the server reports the WebSocket ready and the client attaches.
+          - Keeps transparent post-attach reconnect and event replay.
+          - Includes WebSocket HTTP status codes in handshake errors when iOS exposes the response.
+          - Preserves the accepted background UX architecture in `docs/background-agent-ux.md`.
 
           The attached IPA is **unsigned** and is intended for downstream signing/sideloading workflows.
           EOF
