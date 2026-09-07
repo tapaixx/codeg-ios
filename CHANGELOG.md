@@ -29,6 +29,12 @@ the text as the git tag message and the GitHub Release notes.
   down a still-healthy socket merely because the network path changed.
 - iOS background coordination now starts only after the WebSocket server has
   completed the initial upgrade and the client begins its attach handshake.
+- Native iOS WebSocket upgrades now authenticate with the same
+  `Authorization: Bearer <token>` header used by normal Codeg API requests and
+  advertise only the `codeg-events` application subprotocol. The browser-only
+  `codeg-token.*` authentication subprotocol is no longer used by iOS.
+- WebSocket tokens are trimmed before the upgrade request, matching the web
+  client's normalization behavior.
 
 ### Fixed
 
@@ -41,6 +47,9 @@ the text as the git tag message and the GitHub Release notes.
   "the server returned an invalid response". Handshake failures now include the
   HTTP status code when URLSession exposes it, to distinguish auth/route/proxy
   failures from transport recovery failures.
+- Fixed WebSocket HTTP 403 failures behind CDNs/WAFs that require the normal
+  bearer token during the HTTP Upgrade request rather than accepting an encoded
+  token hidden in `Sec-WebSocket-Protocol`.
 
 ## [1.0.1] - 2026-07-07
 

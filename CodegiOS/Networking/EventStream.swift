@@ -73,10 +73,16 @@ enum WSServerMessage: Decodable, Sendable {
 
 /// A live WebSocket connection to `/ws/events`.
 ///
-/// The initial WebSocket handshake intentionally stays equivalent to upstream:
-/// `start()` only opens the socket. BackgroundTasks, network monitoring and local
-/// notification coordination are activated only after the server has upgraded the
-/// connection and emitted `__ready__`, when `attach(...)` is called.
+/// Native iOS authenticates the WebSocket upgrade with the same
+/// `Authorization: Bearer <token>` header used by normal Codeg API requests.
+/// Only the actual application protocol (`codeg-events`) is advertised through
+/// `Sec-WebSocket-Protocol`. The browser-specific `codeg-token.*` subprotocol is
+/// intentionally not used here: CDNs/WAFs commonly inspect or restrict custom
+/// WebSocket protocols before the request reaches Codeg.
+///
+/// BackgroundTasks, network monitoring and local notification coordination are
+/// activated only after the server has upgraded the connection and emitted
+/// `__ready__`, when `attach(...)` is called.
 ///
 /// Once attached, socket-level drops are recovered inside this transport. The
 /// caller therefore observes one logical stream across ordinary Wi-Fi/5G/VPN
@@ -136,7 +142,7 @@ final class EventStream: @unchecked Sendable {
 
     init(baseURL: URL, token: String, session: URLSession = EventStream.streamSession) {
         self.baseURL = baseURL
-        self.token = token
+        self.token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         self.session = session
         self.url = EventStream.websocketURL(from: baseURL)
         var captured: AsyncStream<Frame>.Continuation!
@@ -159,8 +165,7 @@ final class EventStream: @unchecked Sendable {
         lock.unlock()
 
         // Put the attach frame on the already-upgraded socket first. Only after
-        // that do we activate the iOS-specific background support. This preserves
-        // upstream handshake behaviour byte-for-byte through `__ready__`.
+        // that do we activate the iOS-specific background support.
         send(.attach(subscriptionId: subscriptionId, connectionId: connectionId, sinceSeq: resumeSeq))
         activatePostHandshakeSupportIfNeeded()
     }
@@ -207,8 +212,14 @@ final class EventStream: @unchecked Sendable {
         guard !isClosed else { lock.unlock(); return }
         socketGeneration &+= 1
         let generation = socketGeneration
-        let protocols = ["codeg-events", "codeg-token.\(EventStream.base64URLNoPad(token))"]
-        let newTask = session.webSocketTask(with: url, protocols: protocols)
+
+        // Unlike a browser WebSocket, URLSession can carry a normal Authorization
+        // header during the HTTP upgrade. This keeps CDN/WAF authentication and
+        // Codeg authentication identical to every other native API request.
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("codeg-events", forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        let newTask = session.webSocketTask(with: request)
         task = newTask
         lock.unlock()
 
