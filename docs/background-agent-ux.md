@@ -66,6 +66,16 @@ On a socket-level failure after attach:
 
 Network path changes are hints only. Wi-Fi/5G/VPN changes do not proactively tear down a healthy socket. When the network changes from unavailable to available while a retry is already pending, Codeg skips the remaining backoff and retries immediately.
 
+### Native WebSocket authentication and CDN compatibility
+
+The native iOS client authenticates the `/ws/events` HTTP Upgrade with the same bearer token as normal Codeg API requests:
+
+- `Authorization: Bearer <token>` carries authentication through the CDN/WAF and into Codeg.
+- `Sec-WebSocket-Protocol: codeg-events` advertises only the application protocol.
+- The token is trimmed for surrounding whitespace/newlines before the handshake.
+
+The web/browser client may need to encode a token into a secondary WebSocket subprotocol because browser JavaScript cannot freely add an `Authorization` header to `new WebSocket(...)`. Native iOS does not have that limitation and must not rely on the browser-specific `codeg-token.*` subprotocol. This keeps CDN authentication behavior consistent between ordinary API calls and the WebSocket upgrade and avoids intermediaries rejecting token-bearing custom subprotocol values.
+
 ## Reconnect UX
 
 Desired UI policy if transport state is surfaced later:
