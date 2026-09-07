@@ -73,16 +73,15 @@ enum WSServerMessage: Decodable, Sendable {
 
 /// A live WebSocket connection to `/ws/events`.
 ///
-/// The public contract remains `start → ready → attach → frames → close`, but a
-/// socket-level drop after a successful attach is now recovered *inside* this
-/// transport. The caller therefore keeps one logical stream across Wi-Fi/5G/VPN
-/// transitions and ordinary iOS background suspension instead of turning each
-/// transport blip into visible chat state.
+/// The initial WebSocket handshake intentionally stays equivalent to upstream:
+/// `start()` only opens the socket. BackgroundTasks, network monitoring and local
+/// notification coordination are activated only after the server has upgraded the
+/// connection and emitted `__ready__`, when `attach(...)` is called.
 ///
-/// Recovery reuses the same subscription + server-side ACP connection and sends
-/// `since_seq` so missed events are replayed. Only after several consecutive
-/// reconnect failures does the stream finally emit `.closed`, allowing the
-/// existing SessionDetail fallback to reconcile against the server.
+/// Once attached, socket-level drops are recovered inside this transport. The
+/// caller therefore observes one logical stream across ordinary Wi-Fi/5G/VPN
+/// changes and iOS suspension. Recovery reuses the same subscription + ACP
+/// connection and sends `since_seq` so missed events are replayed.
 final class EventStream: @unchecked Sendable {
     enum Frame: Sendable {
         case ready
@@ -116,12 +115,15 @@ final class EventStream: @unchecked Sendable {
     private var reconnectWorkItem: DispatchWorkItem?
     private static let maxTransparentReconnects = 6
 
+    /// Deliberately nil during the initial WebSocket handshake. These are only
+    /// created after `.ready` and `attach(...)` so system background machinery can
+    /// never interfere with establishing the transport itself.
     private var networkListenerID: UUID?
     private var backgroundTurnHandle: UUID?
 
-    /// Dedicated session for the long-lived event socket. `URLSession.shared`'s
-    /// default 60s inactivity timeout is inappropriate for agent streams because a
-    /// tool or approval may legitimately stay quiet for minutes.
+    /// Dedicated session for the long-lived event socket. A quiet agent turn can
+    /// legitimately stay idle for minutes, so URLSession's default inactivity
+    /// timeout is inappropriate here; ping/pong detects genuine socket death.
     static let streamSession: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 604_800
@@ -142,23 +144,10 @@ final class EventStream: @unchecked Sendable {
         self.continuation = captured
     }
 
+    /// Keep this path intentionally minimal. Do not register background tasks,
+    /// request notification permission or start NWPathMonitor before the server
+    /// has accepted the WebSocket upgrade.
     func start() {
-        BackgroundAgentCoordinator.shared.configure()
-
-        lock.lock()
-        guard !isClosed else { lock.unlock(); return }
-        if backgroundTurnHandle == nil {
-            backgroundTurnHandle = BackgroundAgentCoordinator.shared.beginTurn()
-        }
-        lock.unlock()
-
-        let listenerID = BackgroundAgentCoordinator.shared.addNetworkRecoveryListener { [weak self] in
-            self?.networkBecameAvailable()
-        }
-        lock.lock()
-        networkListenerID = listenerID
-        lock.unlock()
-
         openSocket()
     }
 
@@ -168,7 +157,12 @@ final class EventStream: @unchecked Sendable {
         attachedConnectionID = connectionId
         let resumeSeq = sinceSeq ?? lastSeq
         lock.unlock()
+
+        // Put the attach frame on the already-upgraded socket first. Only after
+        // that do we activate the iOS-specific background support. This preserves
+        // upstream handshake behaviour byte-for-byte through `__ready__`.
         send(.attach(subscriptionId: subscriptionId, connectionId: connectionId, sinceSeq: resumeSeq))
+        activatePostHandshakeSupportIfNeeded()
     }
 
     func detach(subscriptionId: String) {
@@ -219,7 +213,7 @@ final class EventStream: @unchecked Sendable {
         lock.unlock()
 
         newTask.resume()
-        receiveLoop(generation: generation)
+        receiveLoop(generation: generation, socket: newTask)
         scheduleNextPing(generation: generation)
     }
 
@@ -230,21 +224,28 @@ final class EventStream: @unchecked Sendable {
         t?.send(.string(text)) { _ in }
     }
 
-    private func receiveLoop(generation: Int) {
-        lock.lock()
-        let t = generation == socketGeneration ? task : nil
-        lock.unlock()
-        t?.receive { [weak self] result in
+    private func receiveLoop(generation: Int, socket: URLSessionWebSocketTask) {
+        guard isCurrent(generation) else { return }
+        socket.receive { [weak self, weak socket] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
-                self.socketFailed(reason: error.localizedDescription, generation: generation)
+                let reason = Self.describeSocketFailure(error, response: socket?.response)
+                self.socketFailed(reason: reason, generation: generation)
             case .success(let message):
                 guard self.isCurrent(generation) else { return }
                 self.handle(message)
-                if self.isCurrent(generation) { self.receiveLoop(generation: generation) }
+                if self.isCurrent(generation), let socket {
+                    self.receiveLoop(generation: generation, socket: socket)
+                }
             }
         }
+    }
+
+    private static func describeSocketFailure(_ error: Error, response: URLResponse?) -> String {
+        let base = error.localizedDescription
+        guard let http = response as? HTTPURLResponse else { return base }
+        return "\(base) (WebSocket HTTP \(http.statusCode))"
     }
 
     private func socketFailed(reason: String?, generation: Int) {
@@ -276,7 +277,7 @@ final class EventStream: @unchecked Sendable {
 
         let shift = min(reconnectAttempt - 1, 4)
         delay = min(8, 0.5 * pow(2, Double(shift)))
-        socketGeneration &+= 1 // invalidate callbacks from the failed socket
+        socketGeneration &+= 1
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
 
@@ -298,9 +299,9 @@ final class EventStream: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// Network path recovery is a *hint*, not a reason to tear down a live socket.
-    /// It only short-circuits a reconnect delay that was already scheduled after a
-    /// real socket failure.
+    /// Network path recovery is a hint only. It never tears down a healthy socket;
+    /// it merely skips the remaining backoff after a real failure has already
+    /// scheduled a retry.
     private func networkBecameAvailable() {
         lock.lock()
         guard !isClosed, let work = reconnectWorkItem else { lock.unlock(); return }
@@ -308,6 +309,43 @@ final class EventStream: @unchecked Sendable {
         reconnectWorkItem = nil
         lock.unlock()
         DispatchQueue.global(qos: .utility).async { [weak self] in self?.openSocket() }
+    }
+
+    private func activatePostHandshakeSupportIfNeeded() {
+        lock.lock()
+        guard !isClosed else { lock.unlock(); return }
+        let needsNetworkListener = networkListenerID == nil
+        let needsBackgroundTurn = backgroundTurnHandle == nil
+        lock.unlock()
+
+        let coordinator = BackgroundAgentCoordinator.shared
+        coordinator.configure()
+
+        if needsBackgroundTurn {
+            let handle = coordinator.beginTurn()
+            lock.lock()
+            if !isClosed, backgroundTurnHandle == nil {
+                backgroundTurnHandle = handle
+                lock.unlock()
+            } else {
+                lock.unlock()
+                coordinator.endTurn(handle)
+            }
+        }
+
+        if needsNetworkListener {
+            let listenerID = coordinator.addNetworkRecoveryListener { [weak self] in
+                self?.networkBecameAvailable()
+            }
+            lock.lock()
+            if !isClosed, networkListenerID == nil {
+                networkListenerID = listenerID
+                lock.unlock()
+            } else {
+                lock.unlock()
+                coordinator.removeNetworkRecoveryListener(listenerID)
+            }
+        }
     }
 
     private func markHealthy() {
@@ -369,10 +407,11 @@ final class EventStream: @unchecked Sendable {
         let t = (!isClosed && generation == socketGeneration) ? task : nil
         lock.unlock()
         guard let t else { return }
-        t.sendPing { [weak self] error in
+        t.sendPing { [weak self, weak t] error in
             guard let self else { return }
             if let error {
-                self.socketFailed(reason: error.localizedDescription, generation: generation)
+                let reason = Self.describeSocketFailure(error, response: t?.response)
+                self.socketFailed(reason: reason, generation: generation)
             } else if self.isCurrent(generation) {
                 self.markHealthy()
                 self.scheduleNextPing(generation: generation)
@@ -529,7 +568,7 @@ final class EventStream: @unchecked Sendable {
 
     /// A reattach snapshot is authoritative pending state. If transport recovery
     /// happened while the approval event was in flight, recreate the background
-    /// notification from the snapshot; otherwise remove stale delivered actions.
+    /// notification from the snapshot.
     private func syncPendingNotifications(from snapshot: LiveSessionSnapshot) {
         lock.lock()
         let connectionID = attachedConnectionID
