@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 // MARK: - WebSocket attach-protocol messages
 
@@ -70,10 +71,18 @@ enum WSServerMessage: Decodable, Sendable {
 
 // MARK: - EventStream
 
-/// A live WebSocket connection to `/ws/events`. Emits decoded frames on
-/// `frames`. Lifecycle: `start()` → await `.ready` → `attach(...)` → consume
-/// `.event` frames → `close()`. Reconnection is the caller's responsibility
-/// (Phase 1 reconnects by creating a fresh stream).
+/// A live WebSocket connection to `/ws/events`.
+///
+/// The public contract remains `start → ready → attach → frames → close`, but a
+/// socket-level drop after a successful attach is now recovered *inside* this
+/// transport. The caller therefore keeps one logical stream across Wi-Fi/5G/VPN
+/// transitions and ordinary iOS background suspension instead of turning each
+/// transport blip into visible chat state.
+///
+/// Recovery reuses the same subscription + server-side ACP connection and sends
+/// `since_seq` so missed events are replayed. Only after several consecutive
+/// reconnect failures does the stream finally emit `.closed`, allowing the
+/// existing SessionDetail fallback to reconcile against the server.
 final class EventStream: @unchecked Sendable {
     enum Frame: Sendable {
         case ready
@@ -87,36 +96,44 @@ final class EventStream: @unchecked Sendable {
 
     let frames: AsyncStream<Frame>
     private let continuation: AsyncStream<Frame>.Continuation
+    private let baseURL: URL
     private let url: URL
     private let token: String
     private let session: URLSession
     private let lock = NSLock()
+
     private var task: URLSessionWebSocketTask?
     private var isClosed = false
+    private var socketGeneration = 0
+
+    /// Logical attach identity. These survive replacement of the physical socket.
+    private var attachedSubscriptionID: String?
+    private var attachedConnectionID: String?
+    private var lastSeq: UInt64?
+
+    /// Internal, invisible socket recovery. A healthy frame resets the budget.
+    private var reconnectAttempt = 0
+    private var reconnectWorkItem: DispatchWorkItem?
+    private static let maxTransparentReconnects = 6
+
+    private var networkListenerID: UUID?
+    private var backgroundTurnHandle: UUID?
 
     /// Dedicated session for the long-lived event socket. `URLSession.shared`'s
-    /// default `timeoutIntervalForRequest` (60s) is an *inactivity* timeout that,
-    /// on a WebSocket, fires whenever the agent goes quiet — a long tool call, a
-    /// pause for a permission prompt — and tears down a perfectly healthy stream,
-    /// surfacing a spurious error even though the server is fine. A live agent
-    /// owns the pacing, so the socket must be allowed to sit idle indefinitely;
-    /// genuine death is instead detected by the keepalive ping below. (The
-    /// browser WebSocket the web client uses has no such idle timeout — this
-    /// brings parity.)
+    /// default 60s inactivity timeout is inappropriate for agent streams because a
+    /// tool or approval may legitimately stay quiet for minutes.
     static let streamSession: URLSession = {
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 604_800   // 7 days — effectively no idle timeout
+        cfg.timeoutIntervalForRequest = 604_800
         cfg.timeoutIntervalForResource = 604_800
         cfg.waitsForConnectivity = true
         return URLSession(configuration: cfg)
     }()
 
-    /// Seconds between keepalive pings. With the idle timeout disabled, these are
-    /// how a genuinely dead connection is detected: the pong handler errors when
-    /// the socket is gone, and we surface that as a `.closed` frame.
     private static let pingInterval: TimeInterval = 20
 
     init(baseURL: URL, token: String, session: URLSession = EventStream.streamSession) {
+        self.baseURL = baseURL
         self.token = token
         self.session = session
         self.url = EventStream.websocketURL(from: baseURL)
@@ -126,36 +143,85 @@ final class EventStream: @unchecked Sendable {
     }
 
     func start() {
-        let protocols = ["codeg-events", "codeg-token.\(EventStream.base64URLNoPad(token))"]
-        let newTask = session.webSocketTask(with: url, protocols: protocols)
-        lock.lock(); task = newTask; lock.unlock()
-        newTask.resume()
-        receiveLoop()
-        // Begin the keepalive after one interval so the handshake completes first
-        // (a ping fired before the socket connects would error and falsely close).
-        scheduleNextPing()
+        BackgroundAgentCoordinator.shared.configure()
+
+        lock.lock()
+        guard !isClosed else { lock.unlock(); return }
+        if backgroundTurnHandle == nil {
+            backgroundTurnHandle = BackgroundAgentCoordinator.shared.beginTurn()
+        }
+        lock.unlock()
+
+        let listenerID = BackgroundAgentCoordinator.shared.addNetworkRecoveryListener { [weak self] in
+            self?.networkBecameAvailable()
+        }
+        lock.lock()
+        networkListenerID = listenerID
+        lock.unlock()
+
+        openSocket()
     }
 
     func attach(subscriptionId: String, connectionId: String, sinceSeq: UInt64? = nil) {
-        send(.attach(subscriptionId: subscriptionId, connectionId: connectionId, sinceSeq: sinceSeq))
+        lock.lock()
+        attachedSubscriptionID = subscriptionId
+        attachedConnectionID = connectionId
+        let resumeSeq = sinceSeq ?? lastSeq
+        lock.unlock()
+        send(.attach(subscriptionId: subscriptionId, connectionId: connectionId, sinceSeq: resumeSeq))
     }
 
-    func detach(subscriptionId: String) { send(.detach(subscriptionId: subscriptionId)) }
+    func detach(subscriptionId: String) {
+        send(.detach(subscriptionId: subscriptionId))
+    }
 
     func ping() { send(.ping) }
 
     func close() {
+        let t: URLSessionWebSocketTask?
+        let listenerID: UUID?
+        let backgroundHandle: UUID?
         lock.lock()
         let alreadyClosed = isClosed
         isClosed = true
-        let t = task
+        socketGeneration &+= 1
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        t = task
+        task = nil
+        listenerID = networkListenerID
+        networkListenerID = nil
+        backgroundHandle = backgroundTurnHandle
+        backgroundTurnHandle = nil
         lock.unlock()
         guard !alreadyClosed else { return }
+
+        if let listenerID {
+            BackgroundAgentCoordinator.shared.removeNetworkRecoveryListener(listenerID)
+        }
+        if let backgroundHandle {
+            BackgroundAgentCoordinator.shared.endTurn(backgroundHandle)
+        }
         t?.cancel(with: .goingAway, reason: nil)
         continuation.finish()
     }
 
-    // MARK: - Private
+    // MARK: - Socket lifecycle
+
+    private func openSocket() {
+        lock.lock()
+        guard !isClosed else { lock.unlock(); return }
+        socketGeneration &+= 1
+        let generation = socketGeneration
+        let protocols = ["codeg-events", "codeg-token.\(EventStream.base64URLNoPad(token))"]
+        let newTask = session.webSocketTask(with: url, protocols: protocols)
+        task = newTask
+        lock.unlock()
+
+        newTask.resume()
+        receiveLoop(generation: generation)
+        scheduleNextPing(generation: generation)
+    }
 
     private func send(_ message: WSClientMessage) {
         guard let data = try? CodegJSON.encoder.encode(message),
@@ -164,57 +230,157 @@ final class EventStream: @unchecked Sendable {
         t?.send(.string(text)) { _ in }
     }
 
-    private func receiveLoop() {
-        lock.lock(); let t = task; lock.unlock()
+    private func receiveLoop(generation: Int) {
+        lock.lock()
+        let t = generation == socketGeneration ? task : nil
+        lock.unlock()
         t?.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
-                self.finish(reason: error.localizedDescription)
+                self.socketFailed(reason: error.localizedDescription, generation: generation)
             case .success(let message):
+                guard self.isCurrent(generation) else { return }
                 self.handle(message)
-                self.lock.lock(); let closed = self.isClosed; self.lock.unlock()
-                if !closed { self.receiveLoop() }
+                if self.isCurrent(generation) { self.receiveLoop(generation: generation) }
             }
         }
     }
 
-    private func finish(reason: String?) {
+    private func socketFailed(reason: String?, generation: Int) {
         lock.lock()
-        let already = isClosed
-        isClosed = true
+        guard generation == socketGeneration, !isClosed else { lock.unlock(); return }
+        let canRecover = attachedSubscriptionID != nil && attachedConnectionID != nil
         lock.unlock()
-        guard !already else { return }
+
+        if canRecover {
+            scheduleTransparentReconnect(reason: reason)
+        } else {
+            finishTerminal(reason: reason)
+        }
+    }
+
+    private func scheduleTransparentReconnect(reason: String?) {
+        let delay: TimeInterval
+        let work: DispatchWorkItem
+
+        lock.lock()
+        guard !isClosed else { lock.unlock(); return }
+        reconnectWorkItem?.cancel()
+        reconnectAttempt += 1
+        guard reconnectAttempt <= Self.maxTransparentReconnects else {
+            lock.unlock()
+            finishTerminal(reason: reason)
+            return
+        }
+
+        let shift = min(reconnectAttempt - 1, 4)
+        delay = min(8, 0.5 * pow(2, Double(shift)))
+        socketGeneration &+= 1 // invalidate callbacks from the failed socket
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+
+        work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let valid = !self.isClosed && self.reconnectWorkItem?.isCancelled == false
+            self.reconnectWorkItem = nil
+            self.lock.unlock()
+            if valid { self.openSocket() }
+        }
+        reconnectWorkItem = work
+        let handle = backgroundTurnHandle
+        lock.unlock()
+
+        if let handle {
+            BackgroundAgentCoordinator.shared.updateTurn(handle, subtitle: "Keeping the agent connected…")
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Network path recovery is a *hint*, not a reason to tear down a live socket.
+    /// It only short-circuits a reconnect delay that was already scheduled after a
+    /// real socket failure.
+    private func networkBecameAvailable() {
+        lock.lock()
+        guard !isClosed, let work = reconnectWorkItem else { lock.unlock(); return }
+        work.cancel()
+        reconnectWorkItem = nil
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).async { [weak self] in self?.openSocket() }
+    }
+
+    private func markHealthy() {
+        lock.lock()
+        reconnectAttempt = 0
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        let handle = backgroundTurnHandle
+        lock.unlock()
+        if let handle {
+            BackgroundAgentCoordinator.shared.updateTurn(handle, subtitle: "Agent is working")
+            BackgroundAgentCoordinator.shared.pulseTurn(handle)
+        }
+    }
+
+    private func finishTerminal(reason: String?) {
+        let listenerID: UUID?
+        let backgroundHandle: UUID?
+        lock.lock()
+        guard !isClosed else { lock.unlock(); return }
+        isClosed = true
+        socketGeneration &+= 1
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        listenerID = networkListenerID
+        networkListenerID = nil
+        backgroundHandle = backgroundTurnHandle
+        backgroundTurnHandle = nil
+        lock.unlock()
+
+        if let listenerID {
+            BackgroundAgentCoordinator.shared.removeNetworkRecoveryListener(listenerID)
+        }
+        if let backgroundHandle {
+            BackgroundAgentCoordinator.shared.endTurn(backgroundHandle)
+        }
         continuation.yield(.closed(reason: reason))
         continuation.finish()
     }
 
+    private func isCurrent(_ generation: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !isClosed && generation == socketGeneration
+    }
+
     // MARK: - Keepalive
 
-    /// Schedule the next keepalive ping after `pingInterval`, unless closed.
-    private func scheduleNextPing() {
-        lock.lock(); let closed = isClosed; lock.unlock()
-        guard !closed else { return }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + EventStream.pingInterval) { [weak self] in
-            self?.sendKeepalivePing()
+    private func scheduleNextPing(generation: Int) {
+        guard isCurrent(generation) else { return }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.pingInterval) { [weak self] in
+            self?.sendKeepalivePing(generation: generation)
         }
     }
 
-    /// Send a WebSocket ping and reschedule on success. On failure the socket is
-    /// genuinely gone, so finish the stream. A quiet-but-healthy turn never trips
-    /// this — the server (axum) always returns the pong, resetting the cycle.
-    private func sendKeepalivePing() {
-        lock.lock(); let closed = isClosed; let t = task; lock.unlock()
-        guard !closed, let t else { return }
+    private func sendKeepalivePing(generation: Int) {
+        lock.lock()
+        let t = (!isClosed && generation == socketGeneration) ? task : nil
+        lock.unlock()
+        guard let t else { return }
         t.sendPing { [weak self] error in
             guard let self else { return }
             if let error {
-                self.finish(reason: error.localizedDescription)
-            } else {
-                self.scheduleNextPing()
+                self.socketFailed(reason: error.localizedDescription, generation: generation)
+            } else if self.isCurrent(generation) {
+                self.markHealthy()
+                self.scheduleNextPing(generation: generation)
             }
         }
     }
+
+    // MARK: - Frame decoding / side effects
 
     private func handle(_ message: URLSessionWebSocketTask.Message) {
         let data: Data
@@ -227,23 +393,176 @@ final class EventStream: @unchecked Sendable {
     }
 
     private func decode(_ data: Data) {
-        // The socket multiplexes the legacy firehose ({channel, payload}) with
-        // the attach protocol ({type, ...}). Route on which key is present.
         if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let channel = obj["channel"] as? String {
-                if channel == "__ready__" { continuation.yield(.ready) }
-                return // ignore other legacy global events in Phase 1
+                if channel == "__ready__" {
+                    markHealthy()
+                    continuation.yield(.ready)
+                }
+                return
             }
             guard obj["type"] is String else { return }
         }
         guard let message = try? CodegJSON.decoder.decode(WSServerMessage.self, from: data) else { return }
+
+        markHealthy()
         switch message {
-        case .snapshot(let snapshot): continuation.yield(.snapshot(snapshot))
-        case .replay(let events): continuation.yield(.replay(events))
-        case .event(let envelope): continuation.yield(.event(envelope))
-        case .detached(let reason): continuation.yield(.detached(reason: reason))
-        case .pong: continuation.yield(.pong)
-        case .unknown: break
+        case .snapshot(let snapshot):
+            if let seq = snapshot.eventSeq { remember(seq: seq) }
+            syncPendingNotifications(from: snapshot)
+            continuation.yield(.snapshot(snapshot))
+
+        case .replay(let events):
+            remember(events: events)
+            events.forEach { observe(event: $0.event) }
+            continuation.yield(.replay(events))
+
+        case .event(let envelope):
+            remember(seq: envelope.seq)
+            observe(event: envelope.event)
+            continuation.yield(.event(envelope))
+
+        case .detached(let reason):
+            continuation.yield(.detached(reason: reason))
+
+        case .pong:
+            continuation.yield(.pong)
+
+        case .unknown:
+            break
+        }
+    }
+
+    private func remember(events: [EventEnvelope]) {
+        if let seq = events.map(\.seq).max() { remember(seq: seq) }
+    }
+
+    private func remember(seq: UInt64) {
+        lock.lock()
+        if seq > (lastSeq ?? 0) { lastSeq = seq }
+        lock.unlock()
+    }
+
+    private func observe(event: AcpEvent) {
+        lock.lock()
+        let connectionID = attachedConnectionID
+        let backgroundHandle = backgroundTurnHandle
+        lock.unlock()
+        guard let connectionID else { return }
+
+        let coordinator = BackgroundAgentCoordinator.shared
+        let client = CodegClient(baseURL: baseURL, token: token)
+        let appIsBackgrounded = UIApplication.shared.applicationState != .active
+
+        switch event {
+        case .contentDelta, .thinking:
+            if let backgroundHandle {
+                coordinator.updateTurn(backgroundHandle, subtitle: "Generating reply…")
+            }
+
+        case .toolCall(_, let title, _, _, _, _, _, _):
+            if let backgroundHandle {
+                coordinator.updateTurn(
+                    backgroundHandle,
+                    subtitle: title.isEmpty ? "Running a tool…" : "Running \(title)…"
+                )
+            }
+
+        case .toolCallUpdate(_, let title, _, _, _, _, _, _):
+            if let backgroundHandle, let title, !title.isEmpty {
+                coordinator.updateTurn(backgroundHandle, subtitle: "Running \(title)…")
+            }
+
+        case .permissionRequest(let requestID, let toolCall, let options):
+            if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Waiting for permission") }
+            if appIsBackgrounded {
+                coordinator.presentPermission(
+                    client: client,
+                    connectionID: connectionID,
+                    requestID: requestID,
+                    toolCall: toolCall,
+                    options: options
+                )
+            }
+
+        case .permissionResolved(let requestID):
+            coordinator.resolvePermissionNotification(requestID: requestID)
+
+        case .questionRequest(let questionID, let questions):
+            if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Waiting for your answer") }
+            if appIsBackgrounded {
+                coordinator.presentQuestion(
+                    client: client,
+                    connectionID: connectionID,
+                    questionID: questionID,
+                    questions: questions
+                )
+            }
+
+        case .questionResolved(let questionID):
+            coordinator.resolveQuestionNotification(questionID: questionID)
+
+        case .planApprovalRequest(let approvalID, _, let planMarkdown):
+            if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Waiting for plan approval") }
+            if appIsBackgrounded {
+                coordinator.presentPlanApproval(
+                    client: client,
+                    connectionID: connectionID,
+                    approvalID: approvalID,
+                    planMarkdown: planMarkdown
+                )
+            }
+
+        case .planApprovalResolved(let approvalID):
+            coordinator.resolvePlanNotification(approvalID: approvalID)
+
+        case .turnComplete:
+            if appIsBackgrounded { coordinator.notifyTurnCompleted() }
+
+        case .error(let message, _):
+            if appIsBackgrounded { coordinator.notifyTurnFailed(message) }
+
+        default:
+            break
+        }
+    }
+
+    /// A reattach snapshot is authoritative pending state. If transport recovery
+    /// happened while the approval event was in flight, recreate the background
+    /// notification from the snapshot; otherwise remove stale delivered actions.
+    private func syncPendingNotifications(from snapshot: LiveSessionSnapshot) {
+        lock.lock()
+        let connectionID = attachedConnectionID
+        lock.unlock()
+        guard UIApplication.shared.applicationState != .active,
+              let connectionID else { return }
+
+        let coordinator = BackgroundAgentCoordinator.shared
+        let client = CodegClient(baseURL: baseURL, token: token)
+        if let p = snapshot.pendingPermission {
+            coordinator.presentPermission(
+                client: client,
+                connectionID: connectionID,
+                requestID: p.requestId,
+                toolCall: p.toolCall,
+                options: p.options
+            )
+        }
+        if let q = snapshot.pendingQuestion {
+            coordinator.presentQuestion(
+                client: client,
+                connectionID: connectionID,
+                questionID: q.questionId,
+                questions: q.questions
+            )
+        }
+        if let p = snapshot.pendingPlanApproval {
+            coordinator.presentPlanApproval(
+                client: client,
+                connectionID: connectionID,
+                approvalID: p.approvalId,
+                planMarkdown: p.planMarkdown
+            )
         }
     }
 
