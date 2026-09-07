@@ -47,7 +47,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.codeg.ios
         PRODUCT_NAME: Codeg
         MARKETING_VERSION: "1.0.1"
-        CURRENT_PROJECT_VERSION: "2"
+        CURRENT_PROJECT_VERSION: "3"
         ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS: "NO"
         # App icon lives in Assets.xcassets/AppIcon.appiconset (single-size 1024 universal).
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -63,6 +63,12 @@ targets:
         # the build setting and silently freezes the displayed version.
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        # iOS 26 continued-processing identifiers are dynamically suffixed per
+        # user-started agent turn. The wildcard is the permitted base identifier.
+        BGTaskSchedulerPermittedIdentifiers:
+          - app.codeg.ios.continued.agent.*
+        UIBackgroundModes:
+          - processing
         # App-UI localizations. The String Catalog (Localizable.xcstrings) carries
         # the actual translations; this advertises them at runtime so an in-app
         # `.environment(\.locale, …)` override (the Language picker) can resolve
