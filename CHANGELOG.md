@@ -27,6 +27,8 @@ the text as the git tag message and the GitHub Release notes.
   have to become visible chat reconnect state.
 - Network restoration accelerates an already-pending reconnect without tearing
   down a still-healthy socket merely because the network path changed.
+- iOS background coordination now starts only after the WebSocket server has
+  completed the initial upgrade and the client begins its attach handshake.
 
 ### Fixed
 
@@ -34,6 +36,11 @@ the text as the git tag message and the GitHub Release notes.
   itself as a connection failure.
 - Pending interactive requests are restored from an authoritative re-attach
   snapshot and can be surfaced as background actions after a transient drop.
+- Restored the upstream-equivalent initial WebSocket handshake path after the
+  first tapaixx background build could fail before attach with iOS reporting
+  "the server returned an invalid response". Handshake failures now include the
+  HTTP status code when URLSession exposes it, to distinguish auth/route/proxy
+  failures from transport recovery failures.
 
 ## [1.0.1] - 2026-07-07
 
