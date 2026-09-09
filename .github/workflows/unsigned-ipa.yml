@@ -88,7 +88,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v1.0.1-tapaixx.3
+          TAG: v1.0.1-tapaixx.4
           BASENAME: ${{ steps.package.outputs.basename }}
           VERSION: ${{ steps.package.outputs.version }}
           BUILD: ${{ steps.package.outputs.build }}
@@ -98,13 +98,16 @@ jobs:
           SHA="build/ipa/${BASENAME}.ipa.sha256"
 
           cat > build/release-notes.md <<EOF
-          ## Codeg iOS ${VERSION} (${BUILD}) — tapaixx WebSocket bearer-auth hotfix
+          ## Codeg iOS ${VERSION} (${BUILD}) — tapaixx Live Activity UX update
 
-          - Sends the Codeg token in `Authorization: Bearer ...` during the native iOS WebSocket HTTP upgrade, matching normal API requests.
-          - Advertises only the real `codeg-events` WebSocket subprotocol instead of encoding the token into a browser-style custom subprotocol.
+          - Sends the Codeg token in Authorization: Bearer during the native iOS WebSocket HTTP upgrade, matching normal API requests.
+          - Advertises only the codeg-events WebSocket subprotocol instead of encoding the token into a browser-style custom subprotocol.
           - Trims surrounding whitespace/newlines from the WebSocket token before authentication.
+          - Shows elapsed task time and meaningful phases instead of pretending an agent has a known completion percentage.
+          - Throttles system Live Activity updates so the Dynamic Island can collapse naturally after backgrounding.
+          - Tapping the system Live Activity routes to the active conversation or new task; multi-task taps open Activity.
+          - Persists only non-sensitive routing and timing hints for launch restoration.
           - Keeps transparent post-attach reconnect, event replay, continued processing, and actionable background notifications.
-          - Preserves HTTP status diagnostics for failed WebSocket handshakes.
 
           The attached IPA is **unsigned** and is intended for downstream signing/sideloading workflows.
           EOF
