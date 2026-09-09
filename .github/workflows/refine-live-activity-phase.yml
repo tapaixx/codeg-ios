@@ -1,0 +1,30 @@
+name: Refine Live Activity phase
+
+on:
+  push:
+    branches: [feature/live-activity-task-ux]
+    paths:
+      - scripts/refine_live_activity_phase.py
+      - .github/workflows/refine-live-activity-phase.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/live-activity-task-ux
+      - name: Refine phase transitions
+        run: python3 scripts/refine_live_activity_phase.py
+      - name: Commit source changes
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CodegiOS/Networking/EventStream.swift CodegiOS/Background/BackgroundAgentCoordinator.swift
+          git diff --cached --check
+          git commit -m "Keep Live Activity phase text current without token churn"
+          git push origin HEAD:feature/live-activity-task-ux
