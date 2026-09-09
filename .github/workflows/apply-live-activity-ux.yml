@@ -1,0 +1,32 @@
+name: Apply Live Activity UX patch
+
+on:
+  push:
+    branches: [feature/live-activity-task-ux]
+    paths:
+      - scripts/apply_live_activity_ux_patch.py
+      - .github/workflows/apply-live-activity-ux.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/live-activity-task-ux
+      - name: Apply patch
+        run: python3 scripts/apply_live_activity_ux_patch.py
+      - name: Remove one-shot patch machinery
+        run: rm scripts/apply_live_activity_ux_patch.py .github/workflows/apply-live-activity-ux.yml
+      - name: Commit patched sources
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Improve continued-processing Live Activity UX"
+          git push origin HEAD:feature/live-activity-task-ux
