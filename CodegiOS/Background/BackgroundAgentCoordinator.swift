@@ -318,9 +318,15 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
             return ("Codeg", "\(activeTurns.count) agent tasks are running")
         }
         if let only = activeTurns.values.first {
+            // The navigation store is created by the session UI and can become
+            // available just after the transport starts. Prefer its persisted
+            // timestamp so elapsed time survives process recreation and never
+            // depends on EventStream/view callback ordering.
+            let startedAt = BackgroundAgentNavigationStore.shared.singleActiveStartedAt(now: now)
+                ?? only.startedAt
             return (
                 only.title,
-                "\(only.phase) · \(Self.elapsedText(from: only.startedAt, now: now))"
+                "\(only.phase) · \(Self.elapsedText(from: startedAt, now: now))"
             )
         }
         return ("Codeg", "Agent task")

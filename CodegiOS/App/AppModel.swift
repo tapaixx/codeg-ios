@@ -108,14 +108,13 @@ final class AppModel {
                 openActivityRoot()
                 return
             }
-            guard let client = serverStore.client(for: server) else {
-                openLiveActivityRoute(.conversation(conversationID), serverID: serverID)
-                return
-            }
+            // The persisted record is deliberately a navigation hint. Honor
+            // the user's tap immediately instead of blocking navigation on a
+            // network round-trip; validate in the background and only unwind a
+            // destination when the server definitively says it no longer exists.
+            openLiveActivityRoute(.conversation(conversationID), serverID: serverID)
+            guard let client = serverStore.client(for: server) else { return }
 
-            // Validate when possible. A definite 404/not-found invalidates the
-            // stale hint; transient network/auth failures still open the recorded
-            // conversation because the local hint may be perfectly valid offline.
             Task { [weak self] in
                 guard let self else { return }
                 do {
@@ -125,10 +124,8 @@ final class AppModel {
                     if description.contains("404") || description.contains("not found") {
                         store.invalidate(recordID)
                         self.openActivityRoot()
-                        return
                     }
                 }
-                self.openLiveActivityRoute(.conversation(conversationID), serverID: serverID)
             }
         }
     }
