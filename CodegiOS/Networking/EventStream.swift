@@ -505,10 +505,13 @@ final class EventStream: @unchecked Sendable {
 
         switch event {
         case .contentDelta, .thinking:
-            // Token/thinking deltas are intentionally silent at the system UI
-            // layer. Updating the Live Activity for every streamed frame keeps the
-            // Dynamic Island expanded and communicates no meaningful new state.
-            break
+            // This is a phase signal, not a per-token system update. The
+            // coordinator de-duplicates an unchanged "Generating reply" phase, so
+            // only the first delta after another phase (for example a tool or
+            // approval) can rewrite the Live Activity.
+            if let backgroundHandle {
+                coordinator.updateTurn(backgroundHandle, subtitle: "Generating reply…")
+            }
 
         case .toolCall(_, let title, _, _, _, _, _, _):
             if let backgroundHandle {
@@ -538,6 +541,7 @@ final class EventStream: @unchecked Sendable {
 
         case .permissionResolved(let requestID):
             coordinator.resolvePermissionNotification(requestID: requestID)
+            if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Working") }
 
         case .questionRequest(let questionID, let questions):
             if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Waiting for your answer") }
@@ -552,6 +556,7 @@ final class EventStream: @unchecked Sendable {
 
         case .questionResolved(let questionID):
             coordinator.resolveQuestionNotification(questionID: questionID)
+            if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Working") }
 
         case .planApprovalRequest(let approvalID, _, let planMarkdown):
             if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Waiting for plan approval") }
@@ -566,6 +571,7 @@ final class EventStream: @unchecked Sendable {
 
         case .planApprovalResolved(let approvalID):
             coordinator.resolvePlanNotification(approvalID: approvalID)
+            if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Working") }
 
         case .turnComplete:
             if appIsBackgrounded { coordinator.notifyTurnCompleted() }

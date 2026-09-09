@@ -140,17 +140,19 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
                 turn.title = title
                 changed = true
             }
+            let wasAttention = Self.isAttentionPhase(turn.phase)
             if turn.phase != nextPhase {
                 turn.phase = nextPhase
                 changed = true
             }
-            attention = Self.isAttentionPhase(nextPhase)
+            // Entering or leaving an interactive wait is important enough to
+            // break the quiet window. Leaving must clear stale "Waiting for
+            // confirmation" text immediately after the user responds.
+            attention = wasAttention || Self.isAttentionPhase(nextPhase)
             activeTurns[handle] = turn
         }
         lock.unlock()
         guard changed else { return }
-        // Permission/question/plan waits are the only phase transitions allowed
-        // to break the post-background quiet window; they need the user's action.
         updateSystemTaskTitle(force: attention)
     }
 
