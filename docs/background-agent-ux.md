@@ -103,6 +103,14 @@ Do not intentionally surface full prompts, source code, shell arguments or tool 
 
 For multiple simultaneous local streams, show aggregate task wording rather than treating each WebSocket reconnect as a new activity.
 
+### Dynamic Island update and navigation policy
+
+The system continued-processing Live Activity is intentionally low-frequency. Agent work has no honest completion percentage, so its `Progress` is indeterminate and the user-facing subtitle carries phase plus wall-clock elapsed time (for example, `Running a tool · Elapsed 4 min`). The first minute is shown as `<1 min`; multiple simultaneous tasks show only an aggregate task count.
+
+Token/thinking deltas and repeated tool updates never rewrite the system title. Entering the background publishes one state, followed by at least a 60-second quiet window; normal elapsed-time refreshes are minute-granularity. Permission/question/plan waits may break the quiet window because they require user action. Task completion ends the continued-processing task immediately. iOS ultimately controls Dynamic Island compact/minimal/expanded presentation, so Codeg reduces update pressure rather than pretending it can force a collapse.
+
+Because the system-owned continued-processing Live Activity does not expose a custom per-task `widgetURL`, a tap launches Codeg using `NSUserActivityTypeLiveActivity`. Codeg persists only non-sensitive navigation/timing hints (`serverID`, conversation or new-session identity, and `startedAt`). A single active task opens its owning server/session, multiple tasks open Activity, and a just-finished task remains routable for approximately two minutes to cover tap/completion races. App-icon launches and ordinary App Switcher foregrounding do not auto-navigate.
+
 ### Important cancellation limitation
 
 `BGContinuedProcessingTask.expirationHandler` is used when the system reclaims resources and also when continued processing is cancelled. The API does not provide a reason enum that lets Codeg reliably distinguish those cases.

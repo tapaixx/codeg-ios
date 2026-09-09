@@ -1,4 +1,5 @@
 import SwiftUI
+import WidgetKit
 
 /// App shell. Adapts to width:
 /// - **Compact** (iPhone): an iOS 26 Liquid Glass `TabView` — Chats · Folders
@@ -47,6 +48,9 @@ struct RootView: View {
         .environment(\.locale, language.locale)
         .preferredColorScheme(appearance.mode.colorScheme)
         .onOpenURL { model.handle(url: $0) }
+        .onContinueUserActivity(NSUserActivityTypeLiveActivity) { _ in
+            model.handleLiveActivityLaunch()
+        }
         .onChange(of: horizontalSizeClass, initial: true) { _, size in
             model.isCompact = size == .compact
         }

@@ -367,7 +367,6 @@ final class EventStream: @unchecked Sendable {
         let handle = backgroundTurnHandle
         lock.unlock()
         if let handle {
-            BackgroundAgentCoordinator.shared.updateTurn(handle, subtitle: "Agent is working")
             BackgroundAgentCoordinator.shared.pulseTurn(handle)
         }
     }
@@ -506,9 +505,10 @@ final class EventStream: @unchecked Sendable {
 
         switch event {
         case .contentDelta, .thinking:
-            if let backgroundHandle {
-                coordinator.updateTurn(backgroundHandle, subtitle: "Generating reply…")
-            }
+            // Token/thinking deltas are intentionally silent at the system UI
+            // layer. Updating the Live Activity for every streamed frame keeps the
+            // Dynamic Island expanded and communicates no meaningful new state.
+            break
 
         case .toolCall(_, let title, _, _, _, _, _, _):
             if let backgroundHandle {
@@ -518,10 +518,11 @@ final class EventStream: @unchecked Sendable {
                 )
             }
 
-        case .toolCallUpdate(_, let title, _, _, _, _, _, _):
-            if let backgroundHandle, let title, !title.isEmpty {
-                coordinator.updateTurn(backgroundHandle, subtitle: "Running \(title)…")
-            }
+        case .toolCallUpdate:
+            // Tool updates are often high frequency. The initial toolCall event is
+            // enough to publish the phase; completion naturally moves on when the
+            // next meaningful event arrives.
+            break
 
         case .permissionRequest(let requestID, let toolCall, let options):
             if let backgroundHandle { coordinator.updateTurn(backgroundHandle, subtitle: "Waiting for permission") }
