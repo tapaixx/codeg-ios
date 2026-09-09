@@ -4,7 +4,7 @@ on:
   push:
     branches: [feature/live-activity-task-ux]
     paths:
-      - scripts/apply_live_activity_ux_patch.py
+      - scripts/apply_live_activity_source_patch.py
       - .github/workflows/apply-live-activity-ux.yml
 
 permissions:
@@ -17,10 +17,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: feature/live-activity-task-ux
-      - name: Apply patch
-        run: python3 scripts/apply_live_activity_ux_patch.py
-      - name: Remove one-shot patch machinery
-        run: rm scripts/apply_live_activity_ux_patch.py .github/workflows/apply-live-activity-ux.yml
+      - name: Apply source patch
+        run: python3 scripts/apply_live_activity_source_patch.py
       - name: Commit patched sources
         run: |
           set -euxo pipefail
