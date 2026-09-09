@@ -24,6 +24,7 @@ struct SessionDetailView: View {
     @State private var renameText = ""
     @State private var showDetails = false
     @State private var showDeleteConfirm = false
+    @State private var backgroundNavigationHandle: UUID?
 
     init(server: ServerProfile, client: CodegClient, conversationID: Int,
          onOpenSession: ((NewSessionRequest) -> Void)? = nil) {
@@ -130,6 +131,12 @@ struct SessionDetailView: View {
             }
         }
         .task { await model.load() }
+        .onChange(of: model.isInFlight, initial: true) { _, inFlight in
+            syncBackgroundNavigation(inFlight: inFlight)
+        }
+        .onChange(of: model.conversationID) { _, _ in
+            updateBackgroundNavigation()
+        }
         .onDisappear { model.teardown() }
         // Haptics — the app's marquee "felt" moments, all keyed off existing
         // @Observable state. Vocabulary: success = a reply completed, error = it
@@ -151,6 +158,36 @@ struct SessionDetailView: View {
             new != nil ? .warning : nil
         }
         .sensoryFeedback(.selection, trigger: model.userToggleTick)
+    }
+
+    private func syncBackgroundNavigation(inFlight: Bool) {
+        let store = BackgroundAgentNavigationStore.shared
+        if inFlight {
+            if let handle = backgroundNavigationHandle {
+                store.updateTask(handle, conversationID: model.conversationID, newSession: model.newRequest)
+            } else {
+                backgroundNavigationHandle = store.beginTask(
+                    serverID: server.id,
+                    conversationID: model.conversationID,
+                    newSession: model.newRequest
+                )
+            }
+            BackgroundAgentCoordinator.shared.navigationMetadataChanged()
+        } else if let handle = backgroundNavigationHandle {
+            store.finishTask(handle)
+            backgroundNavigationHandle = nil
+            BackgroundAgentCoordinator.shared.navigationMetadataChanged()
+        }
+    }
+
+    private func updateBackgroundNavigation() {
+        guard let handle = backgroundNavigationHandle else { return }
+        BackgroundAgentNavigationStore.shared.updateTask(
+            handle,
+            conversationID: model.conversationID,
+            newSession: model.newRequest
+        )
+        BackgroundAgentCoordinator.shared.navigationMetadataChanged()
     }
 
     private var content: some View {

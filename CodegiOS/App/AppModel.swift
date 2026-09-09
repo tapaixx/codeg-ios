@@ -82,6 +82,76 @@ final class AppModel {
 
     // MARK: - Routing
 
+    /// The system-owned continued-processing Live Activity has no custom URL, so
+    /// iOS launches Codeg with NSUserActivityTypeLiveActivity. Resolve the task
+    /// from our lightweight persisted routing hints instead of hijacking normal
+    /// app-icon/App-Switcher foregrounding.
+    func handleLiveActivityLaunch() {
+        let store = BackgroundAgentNavigationStore.shared
+        guard let destination = store.launchDestination() else { return }
+
+        switch destination {
+        case .activity:
+            openActivityRoot()
+
+        case .newSession(let recordID, let serverID, let request):
+            guard serverStore.servers.contains(where: { $0.id == serverID }) else {
+                store.invalidate(recordID)
+                openActivityRoot()
+                return
+            }
+            openLiveActivityRoute(.newSession(request), serverID: serverID)
+
+        case .conversation(let recordID, let serverID, let conversationID):
+            guard let server = serverStore.servers.first(where: { $0.id == serverID }) else {
+                store.invalidate(recordID)
+                openActivityRoot()
+                return
+            }
+            // The persisted record is deliberately a navigation hint. Honor
+            // the user's tap immediately instead of blocking navigation on a
+            // network round-trip; validate in the background and only unwind a
+            // destination when the server definitively says it no longer exists.
+            openLiveActivityRoute(.conversation(conversationID), serverID: serverID)
+            guard let client = serverStore.client(for: server) else { return }
+
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    _ = try await client.conversationDetail(id: conversationID)
+                } catch {
+                    let description = String(describing: error).lowercased()
+                    if description.contains("404") || description.contains("not found") {
+                        store.invalidate(recordID)
+                        self.openActivityRoot()
+                    }
+                }
+            }
+        }
+    }
+
+    private func openLiveActivityRoute(_ route: Route, serverID: ServerProfile.ID) {
+        if selectedServerID != serverID { selectedServerID = serverID }
+        if isCompact {
+            selectedTab = .chats
+            paths[.chats] = [route]
+        } else {
+            sidebarSection = .chats
+            contentPath = []
+            open(route)
+        }
+    }
+
+    private func openActivityRoot() {
+        if isCompact {
+            selectedTab = .activity
+            paths[.activity] = []
+        } else {
+            sidebarSection = .activity
+            contentPath = []
+        }
+    }
+
     /// Open a destination from any entry point. Compact pushes onto the current
     /// tab's stack; regular routes to the appropriate column.
     func open(_ route: Route) {

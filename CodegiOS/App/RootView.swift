@@ -1,4 +1,5 @@
 import SwiftUI
+import WidgetKit
 
 /// App shell. Adapts to width:
 /// - **Compact** (iPhone): an iOS 26 Liquid Glass `TabView` — Chats · Folders
@@ -47,6 +48,13 @@ struct RootView: View {
         .environment(\.locale, language.locale)
         .preferredColorScheme(appearance.mode.colorScheme)
         .onOpenURL { model.handle(url: $0) }
+        .onContinueUserActivity(NSUserActivityTypeLiveActivity) { _ in
+            // A cold Live Activity launch can arrive before the initial
+            // horizontal-size onChange callback. Resolve the shell width here so
+            // an iPhone tap can never be routed through the iPad selection path.
+            model.isCompact = horizontalSizeClass == .compact
+            model.handleLiveActivityLaunch()
+        }
         .onChange(of: horizontalSizeClass, initial: true) { _, size in
             model.isCompact = size == .compact
         }

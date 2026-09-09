@@ -21,7 +21,8 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
 
     private struct ActiveTurn {
         var title: String
-        var subtitle: String
+        var phase: String
+        let startedAt: Date
     }
 
     private enum PendingRequest {
@@ -43,11 +44,17 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
     private var continuedTask: BGContinuedProcessingTask?
     private var continuedTaskIdentifier: String?
     private var continuedProgressTimer: DispatchSourceTimer?
+    private var backgroundedAt: Date?
+    private var lastSystemTaskUpdateAt: Date?
+    private var lastRenderedTitle: String?
+    private var lastRenderedSubtitle: String?
     private var notificationAuthorizationRequested = false
     private var configured = false
 
     private static let continuedIdentifierPrefix = "app.codeg.ios.continued.agent"
     private static let retryTTL: TimeInterval = 60
+    private static let backgroundQuietPeriod: TimeInterval = 60
+    private static let systemUpdateDebounce: TimeInterval = 3
 
     private override init() {
         super.init()
@@ -70,43 +77,99 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
             self?.notifyNetworkRecovered()
         }
         networkMonitor.start(queue: networkQueue)
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+
+    @objc private func applicationDidEnterBackground() {
+        lock.lock()
+        backgroundedAt = Date()
+        lock.unlock()
+        // Publish one useful state when the Dynamic Island becomes relevant, then
+        // leave it alone for at least a minute so iOS can collapse it naturally.
+        updateSystemTaskTitle(force: true)
+    }
+
+    @objc private func applicationWillEnterForeground() {
+        lock.lock()
+        backgroundedAt = nil
+        lock.unlock()
     }
 
     // MARK: - Active turn / continued processing
 
     @discardableResult
-    func beginTurn(title: String = "Codeg agent is working", subtitle: String = "Running in the background") -> UUID {
+    func beginTurn(title: String = "Codeg", subtitle: String = "Working") -> UUID {
         configure()
         requestNotificationAuthorizationIfNeeded()
 
         let handle = UUID()
+        let startedAt = BackgroundAgentNavigationStore.shared.singleActiveStartedAt() ?? Date()
         lock.lock()
-        activeTurns[handle] = ActiveTurn(title: title, subtitle: subtitle)
+        activeTurns[handle] = ActiveTurn(
+            title: title,
+            phase: Self.normalizedPhase(subtitle),
+            startedAt: startedAt
+        )
         let shouldSubmit = continuedTaskIdentifier == nil
         lock.unlock()
 
         if shouldSubmit { submitContinuedProcessingTask() }
-        updateSystemTaskTitle()
+        updateSystemTaskTitle(force: true)
         return handle
     }
 
     func updateTurn(_ handle: UUID, title: String? = nil, subtitle: String) {
+        let nextPhase = Self.normalizedPhase(subtitle)
+        var changed = false
+        var attention = false
         lock.lock()
         if var turn = activeTurns[handle] {
-            if let title { turn.title = title }
-            turn.subtitle = subtitle
+            if let title, turn.title != title {
+                turn.title = title
+                changed = true
+            }
+            let wasAttention = Self.isAttentionPhase(turn.phase)
+            if turn.phase != nextPhase {
+                turn.phase = nextPhase
+                changed = true
+            }
+            // Entering or leaving an interactive wait is important enough to
+            // break the quiet window. Leaving must clear stale "Waiting for
+            // confirmation" text immediately after the user responds.
+            attention = wasAttention || Self.isAttentionPhase(nextPhase)
             activeTurns[handle] = turn
         }
         lock.unlock()
-        updateSystemTaskTitle()
-        pulseProgress()
+        guard changed else { return }
+        updateSystemTaskTitle(force: attention)
     }
 
+    /// Transport liveness is intentionally not a user-facing Live Activity update.
+    /// Token streaming can call this extremely frequently; keeping it a no-op is
+    /// what lets the Dynamic Island settle back to compact/minimal presentation.
     func pulseTurn(_ handle: UUID) {
         lock.lock()
-        let exists = activeTurns[handle] != nil
+        _ = activeTurns[handle]
         lock.unlock()
-        if exists { pulseProgress() }
+    }
+
+    /// Session views call this after persisted routing metadata is created or
+    /// updated. It lets a newly-created record contribute its original start time
+    /// without turning metadata churn into an immediate Dynamic Island expansion.
+    func navigationMetadataChanged() {
+        updateSystemTaskTitle()
     }
 
     func endTurn(_ handle: UUID) {
@@ -146,7 +209,7 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
 
         lock.lock()
         continuedTaskIdentifier = identifier
-        let aggregate = aggregateTitleLocked()
+        let aggregate = aggregateTitleLocked(now: Date())
         lock.unlock()
 
         let request = BGContinuedProcessingTaskRequest(
@@ -176,8 +239,11 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
             return
         }
         continuedTask = task
-        task.progress.totalUnitCount = 1_000_000
-        task.progress.completedUnitCount = 1
+        // Agent turns have no honest completion percentage. Foundation represents
+        // 0/0 as indeterminate progress; the useful user signal is elapsed time
+        // plus the current phase in the title/subtitle, not a fake progress bar.
+        task.progress.totalUnitCount = 0
+        task.progress.completedUnitCount = 0
         lock.unlock()
 
         // iOS invokes this both for system resource expiration and for a person
@@ -205,19 +271,16 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
 
     private func startProgressHeartbeat(for task: BGContinuedProcessingTask, identifier: String) {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + 15, repeating: 15)
+        // Elapsed time is intentionally minute-granularity. Updating every token or
+        // every second keeps the Dynamic Island visually expanded for no benefit.
+        timer.schedule(deadline: .now() + 60, repeating: 60)
         timer.setEventHandler { [weak self, weak task] in
-            guard let self, let task else { return }
+            guard let self, task != nil else { return }
             self.lock.lock()
             let valid = self.continuedTaskIdentifier == identifier && !self.activeTurns.isEmpty
             self.lock.unlock()
             guard valid else { return }
-            // Agent turns do not have a meaningful percent complete. Advancing a
-            // very large progress range represents liveness without pretending the
-            // UI knows how much work remains, and prevents a healthy quiet tool run
-            // from looking stalled to the scheduler.
-            let next = min(task.progress.completedUnitCount + 1, task.progress.totalUnitCount - 1)
-            task.progress.completedUnitCount = next
+            self.updateSystemTaskTitle()
         }
         lock.lock()
         continuedProgressTimer?.cancel()
@@ -226,30 +289,77 @@ final class BackgroundAgentCoordinator: NSObject, @unchecked Sendable {
         timer.resume()
     }
 
-    private func pulseProgress() {
+    private func updateSystemTaskTitle(force: Bool = false) {
+        let now = Date()
         lock.lock()
-        let task = continuedTask
+        guard let task = continuedTask else { lock.unlock(); return }
+        let aggregate = aggregateTitleLocked(now: now)
+        let duplicate = aggregate.title == lastRenderedTitle && aggregate.subtitle == lastRenderedSubtitle
+        let inBackgroundQuietPeriod = backgroundedAt.map {
+            now.timeIntervalSince($0) < Self.backgroundQuietPeriod
+        } ?? false
+        let tooSoon = lastSystemTaskUpdateAt.map {
+            now.timeIntervalSince($0) < Self.systemUpdateDebounce
+        } ?? false
+
+        if !force && (duplicate || inBackgroundQuietPeriod || tooSoon) {
+            lock.unlock()
+            return
+        }
+        lastRenderedTitle = aggregate.title
+        lastRenderedSubtitle = aggregate.subtitle
+        lastSystemTaskUpdateAt = now
         lock.unlock()
-        guard let task else { return }
-        task.progress.completedUnitCount = min(task.progress.completedUnitCount + 1, task.progress.totalUnitCount - 1)
+        task.updateTitle(aggregate.title, subtitle: aggregate.subtitle)
     }
 
-    private func updateSystemTaskTitle() {
-        lock.lock()
-        let task = continuedTask
-        let aggregate = aggregateTitleLocked()
-        lock.unlock()
-        task?.updateTitle(aggregate.title, subtitle: aggregate.subtitle)
-    }
-
-    private func aggregateTitleLocked() -> (title: String, subtitle: String) {
+    private func aggregateTitleLocked(now: Date) -> (title: String, subtitle: String) {
         if activeTurns.count > 1 {
             return ("Codeg", "\(activeTurns.count) agent tasks are running")
         }
         if let only = activeTurns.values.first {
-            return (only.title, only.subtitle)
+            // The navigation store is created by the session UI and can become
+            // available just after the transport starts. Prefer its persisted
+            // timestamp so elapsed time survives process recreation and never
+            // depends on EventStream/view callback ordering.
+            let startedAt = BackgroundAgentNavigationStore.shared.singleActiveStartedAt(now: now)
+                ?? only.startedAt
+            return (
+                only.title,
+                "\(only.phase) · \(Self.elapsedText(from: startedAt, now: now))"
+            )
         }
         return ("Codeg", "Agent task")
+    }
+
+    private static func normalizedPhase(_ raw: String) -> String {
+        let cleaned = raw
+            .replacingOccurrences(of: "…", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = cleaned.lowercased()
+        if lower.contains("waiting for permission")
+            || lower.contains("waiting for your answer")
+            || lower.contains("waiting for plan approval") {
+            return "Waiting for confirmation"
+        }
+        if lower.contains("keeping the agent connected") || lower.contains("restoring") {
+            return "Restoring connection"
+        }
+        if lower == "running in the background" || lower == "agent is working" {
+            return "Working"
+        }
+        return cleaned.isEmpty ? "Working" : cleaned
+    }
+
+    private static func isAttentionPhase(_ phase: String) -> Bool {
+        phase.lowercased().contains("waiting for confirmation")
+    }
+
+    private static func elapsedText(from startedAt: Date, now: Date) -> String {
+        let seconds = max(0, now.timeIntervalSince(startedAt))
+        guard seconds >= 60 else { return "Elapsed <1 min" }
+        let minutes = max(1, Int(seconds / 60))
+        return "Elapsed \(minutes) min"
     }
 
     // MARK: - Network path recovery

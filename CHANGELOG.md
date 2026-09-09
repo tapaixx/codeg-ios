@@ -29,6 +29,11 @@ the text as the git tag message and the GitHub Release notes.
   down a still-healthy socket merely because the network path changed.
 - iOS background coordination now starts only after the WebSocket server has
   completed the initial upgrade and the client begins its attach handshake.
+- Continued-processing Live Activity updates are now state-based and minute-
+  granularity, showing elapsed time instead of continuously advancing a fake
+  completion percentage.
+- Tapping the system Live Activity now restores the owning server/session using
+  lightweight persisted routing hints; ordinary app foregrounding remains unchanged.
 - Native iOS WebSocket upgrades now authenticate with the same
   `Authorization: Bearer <token>` header used by normal Codeg API requests and
   advertise only the `codeg-events` application subprotocol. The browser-only
