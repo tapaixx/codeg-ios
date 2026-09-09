@@ -20,7 +20,7 @@ final class BackgroundAgentNavigationStore: @unchecked Sendable {
         var isActive: Bool { finishedAt == nil }
     }
 
-    enum LaunchDestination: Sendable {
+    enum LaunchDestination {
         case conversation(recordID: UUID, serverID: UUID, conversationID: Int)
         case newSession(recordID: UUID, serverID: UUID, request: NewSessionRequest)
         case activity
